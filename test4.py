@@ -128,7 +128,7 @@ class RandomEvalSubsetTrainer(Trainer):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CodeBERT classifier with optional MLflow/DagsHub tracking.")
-    parser.add_argument("--experiment-name", type=str, default="ai_detect_codebert_training")
+    parser.add_argument("--experiment-name", type=str, default="SemEval-Task13-SubtaskA")
     parser.add_argument(
         "--use-dagshub",
         action="store_true",
