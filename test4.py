@@ -1,3 +1,5 @@
+import argparse
+import os
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, Subset
@@ -9,11 +11,14 @@ from transformers import (
 )
 import numpy as np
 import math
-from sklearn.metrics import accuracy_score, f1_score
+import mlflow
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 
 MODEL_NAME = "microsoft/codebert-base"
 MAX_LEN = 512
+DAGSHUB_OWNER = "nghessss"
+DAGSHUB_REPO = "semivalA"
 
 
 class CodeDataset(Dataset):
@@ -50,11 +55,42 @@ class CodeDataset(Dataset):
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=1)
+    precision, recall, f1_macro, _ = precision_recall_fscore_support(
+        labels,
+        preds,
+        average="macro",
+        zero_division=0
+    )
 
     return {
         "accuracy": accuracy_score(labels, preds),
-        "f1": f1_score(labels, preds)
+        "f1_macro": f1_macro,
+        "precision": precision,
+        "recall": recall,
     }
+
+
+def setup_tracking(args):
+    if args.use_dagshub:
+        try:
+            import dagshub
+
+            dagshub.init(
+                repo_owner=args.dagshub_owner,
+                repo_name=args.dagshub_repo,
+                mlflow=True,
+            )
+            print(
+                f"DagsHub tracking enabled for "
+                f"{args.dagshub_owner}/{args.dagshub_repo}"
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "DagsHub tracking requested but 'dagshub' is not installed. "
+                "Install it with: pip install dagshub"
+            ) from exc
+
+    mlflow.set_experiment(args.experiment_name)
 
 
 class RandomEvalSubsetTrainer(Trainer):
@@ -73,8 +109,48 @@ class RandomEvalSubsetTrainer(Trainer):
 
         return super().get_eval_dataloader(eval_dataset)
 
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="val"):
+        val_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        val_metrics = super().evaluate(
+            eval_dataset=val_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix="val",
+        )
+        train_metrics = super().evaluate(
+            eval_dataset=self.train_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix="train",
+        )
+        combined_metrics = {**val_metrics, **train_metrics}
+        self.log(combined_metrics)
+        return combined_metrics
 
-def main():
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train CodeBERT classifier with optional MLflow/DagsHub tracking.")
+    parser.add_argument("--experiment-name", type=str, default="ai_detect_codebert_training")
+    parser.add_argument(
+        "--use-dagshub",
+        action="store_true",
+        help="Send MLflow tracking to DagsHub.",
+    )
+    parser.add_argument(
+        "--dagshub-owner",
+        type=str,
+        default=os.getenv("DAGSHUB_OWNER", DAGSHUB_OWNER),
+        help="DagsHub repo owner.",
+    )
+    parser.add_argument(
+        "--dagshub-repo",
+        type=str,
+        default=os.getenv("DAGSHUB_REPO", DAGSHUB_REPO),
+        help="DagsHub repo name.",
+    )
+    return parser.parse_args()
+
+
+def main(args):
+    setup_tracking(args)
 
     print("Loading datasets...")
     train_df = pd.read_parquet("data/train.parquet")
@@ -111,9 +187,12 @@ def main():
         save_steps=eval_steps,
         logging_dir="./logs",
         load_best_model_at_end=True,
-        metric_for_best_model="f1",
+        metric_for_best_model="val_f1_macro",
         greater_is_better=True,
-        report_to="none"
+        report_to=["mlflow"],
+        logging_strategy="steps",
+        logging_steps=max(1, eval_steps // 2),
+        run_name=args.experiment_name
     )
 
     trainer = RandomEvalSubsetTrainer(
@@ -127,31 +206,47 @@ def main():
     )
 
     print("Training...")
-    trainer.train()
+    with mlflow.start_run():
+        mlflow.set_tag("sub_sample", "true")
+        mlflow.set_tag("sub_sample_data", "train_validation")
+        mlflow.set_tag("sub_sample_size", "100")
+        mlflow.log_param("model_name", MODEL_NAME)
+        mlflow.log_param("max_len", MAX_LEN)
+        mlflow.log_param("train_rows", len(train_df))
+        mlflow.log_param("val_rows", len(val_df))
+        mlflow.log_param("train_batch_size", train_batch_size)
+        mlflow.log_param("eval_steps", eval_steps)
+        mlflow.log_param("eval_sample_size", 100)
+        trainer.train()
 
-    print("Saving best model...")
-    trainer.save_model("./best_codebert_model") 
-    tokenizer.save_pretrained("./best_codebert_model")
+        print("Saving best model...")
+        trainer.save_model("./best_codebert_model")
+        tokenizer.save_pretrained("./best_codebert_model")
 
-    print("Evaluating...")
-    trainer.evaluate()
+        print("Evaluating...")
+        final_metrics = trainer.evaluate()
+        for k, v in final_metrics.items():
+            if isinstance(v, (int, float)):
+                mlflow.log_metric(f"final_{k}", float(v))
 
-    if True:
-        print("Running inference on test set...")
-        preds = trainer.predict(test_dataset)
+        if True:
+            print("Running inference on test set...")
+            preds = trainer.predict(test_dataset)
 
-        logits = preds.predictions
-        labels = np.argmax(logits, axis=1)
+            logits = preds.predictions
+            labels = np.argmax(logits, axis=1)
 
-        submission = pd.DataFrame({
-            "ID": test_df["ID"],
-            "label": labels
-        })
+            submission = pd.DataFrame({
+                "ID": test_df["ID"],
+                "label": labels
+            })
 
-        submission.to_csv("submission.csv", index=False)
+            submission.to_csv("submission.csv", index=False)
+            mlflow.log_artifact("submission.csv", artifact_path="predictions")
 
-        print("submission.csv saved!")
+            print("submission.csv saved!")
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args)
