@@ -1,6 +1,6 @@
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from transformers import (
     RobertaTokenizer,
     RobertaForSequenceClassification,
@@ -8,6 +8,7 @@ from transformers import (
     TrainingArguments
 )
 import numpy as np
+import math
 from sklearn.metrics import accuracy_score, f1_score
 
 
@@ -56,6 +57,23 @@ def compute_metrics(eval_pred):
     }
 
 
+class RandomEvalSubsetTrainer(Trainer):
+    def __init__(self, *args, eval_sample_size=100, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.eval_sample_size = eval_sample_size
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+
+        if self.eval_sample_size is not None and len(eval_dataset) > self.eval_sample_size:
+            indices = np.random.choice(len(eval_dataset), self.eval_sample_size, replace=False)
+            eval_dataset = Subset(eval_dataset, indices.tolist())
+
+        return super().get_eval_dataloader(eval_dataset)
+
+
 def main():
 
     print("Loading datasets...")
@@ -69,6 +87,11 @@ def main():
     val_dataset = CodeDataset(val_df, tokenizer)
     test_dataset = CodeDataset(test_df, tokenizer, is_test=True)
 
+    train_batch_size = 8
+    steps_per_epoch = math.ceil(len(train_dataset) / train_batch_size)
+    eval_steps = max(1, math.ceil(steps_per_epoch * 0.1))
+    print(f"Evaluating every {eval_steps} steps (~0.1 epoch) on 100 random val samples.")
+
     print("Loading model...")
     model = RobertaForSequenceClassification.from_pretrained(
         MODEL_NAME,
@@ -79,11 +102,13 @@ def main():
     training_args = TrainingArguments(
         output_dir="./model",
         learning_rate=2e-5,
-        per_device_train_batch_size=8,
+        per_device_train_batch_size=train_batch_size,
         per_device_eval_batch_size=8,
         num_train_epochs=3,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        eval_strategy="steps",
+        eval_steps=eval_steps,
+        save_strategy="steps",
+        save_steps=eval_steps,
         logging_dir="./logs",
         load_best_model_at_end=True,
         metric_for_best_model="f1",
@@ -91,11 +116,12 @@ def main():
         report_to="none"
     )
 
-    trainer = Trainer(
+    trainer = RandomEvalSubsetTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        eval_sample_size=100,
         # tokenizer=tokenizer,
         compute_metrics=compute_metrics,
     )
@@ -103,10 +129,14 @@ def main():
     print("Training...")
     trainer.train()
 
+    print("Saving best model...")
+    trainer.save_model("./best_codebert_model") 
+    tokenizer.save_pretrained("./best_codebert_model")
+
     print("Evaluating...")
     trainer.evaluate()
 
-    if False:
+    if True:
         print("Running inference on test set...")
         preds = trainer.predict(test_dataset)
 
