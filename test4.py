@@ -96,7 +96,7 @@ def main():
     model = RobertaForSequenceClassification.from_pretrained(
         MODEL_NAME,
         num_labels=2,
-        use_safetensors=True
+        # use_safetensors=True
     )
 
     training_args = TrainingArguments(
