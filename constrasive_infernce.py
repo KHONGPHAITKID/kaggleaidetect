@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from transformers import AutoModel, AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
@@ -87,7 +88,7 @@ def main():
 
     rows = []
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in tqdm(test_loader, desc="Running inference"):
             ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)
 
